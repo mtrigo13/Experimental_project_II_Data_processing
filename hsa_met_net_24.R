@@ -1,0 +1,248 @@
+#definir directoria de trabalho e instalar package igraph
+library(igraph)
+
+
+# ler ficheiro com rede metabólica humana
+load("ghsa_main.RData")
+
+# ler ficheiro com lista de pathways do kegg que aparecem na rede metabólica usada
+load("hsa_path_freq.RData")
+# ler ficheiros com correspondências entre metabolitos e pathways
+load("hsa_path_per_met.RData")
+load("hsa_path_sets.RData")
+
+# ler ficheiro com tabela com todos os metabolitos na rede
+load("hsa_met_tab.RData")
+
+
+# escolher algoritmo de clustering que divide a rede metabólica em módulos/comunidades maximizando a modularidade
+fg=cluster_fast_greedy(ghsa_main)
+sizes(fg)  
+
+modularity(fg)
+
+louvain=cluster_louvain(ghsa_main) 
+sizes(louvain)
+modularity(louvain)
+
+edgebet=cluster_edge_betweenness(ghsa_main)
+sizes(edgebet)
+modularity(edgebet)
+
+wtrap=cluster_walktrap(ghsa_main)
+sizes(wtrap)
+modularity(wtrap)
+
+imap=cluster_infomap(ghsa_main)
+sizes(imap)
+modularity(imap)
+
+lprop=cluster_label_prop(ghsa_main)
+sizes(lprop)
+modularity(lprop)
+
+sglass=cluster_spinglass(ghsa_main)
+sizes(sglass)
+modularity(sglass)
+
+# o algoritmo louvain dá a partição com maior modularidade, pelo que vai ser usada para definir os módulos
+louvmemb=membership(louvain)
+ncom=max(louvmemb)
+
+
+# para futura interpretação dos módulos, fazemos uma matriz que indica que pathways é que estão representadas em cada módulo
+p2com=hsa_path_freq
+for (i in 1:ncom){
+  p2com[,i+4]=0
+  for (j in 1:nrow(hsa_path_freq)){
+    p2com[j,i+4]=length(intersect(which(louvmemb==i),hsa_path_sets[[j]]))
+    names(p2com)[i+4]=paste("cluster",i,sep="_")
+  }
+}
+
+# ler o ficheiro com os vossos dados experimentais
+geralid=read.csv("processed_data.csv",header=T,stringsAsFactors = F)
+
+# vamos usar a massa neutral para fazer a correspondência com metabolitos do kegg
+bucketmass=geralid$Neutral.Mass #as.numeric(bucketmass)
+
+# conversão das massas do kegg para formato numérico
+hsa_met_tab$mass=as.numeric(hsa_met_tab$mass)
+
+
+# comparação das massas neutrais dos picos identitficados nas amostras com as massas dos metabolitos kegg
+for (i in 1:nrow(geralid)){
+  diffkegg=abs(hsa_met_tab$mass-bucketmass[i])
+  rdif=diffkegg/hsa_met_tab$mass
+  geralid$difkegg[i]=min(diffkegg,na.rm=T)
+  ck=which(diffkegg==min(diffkegg,na.rm=T))
+  geralid$closestkegg[i]=hsa_met_tab$id[ck[1]]
+  geralid$ckeggname[i]=hsa_met_tab$name[ck[1]]
+  geralid$ckeggform[i]=hsa_met_tab$formula[ck[1]]
+  geralid$rdif[i]=(min(diffkegg,na.rm=T))/hsa_met_tab$mass[ck[1]]
+  kegg_3=which(rdif<=1e-6)
+  geralid$allkegg[i]=paste(hsa_met_tab$id[kegg_3],sep="|",collapse="|")
+  geralid$allkeggnames[i]=paste(hsa_met_tab$name[kegg_3],sep="|",collapse="|")
+}
+
+# só consideramos um match se a diferença relativa entre massas for menor do que 0.001
+# ou seja, só ficamos com as linhas em que rdfif<1e-3
+keggid=geralid[geralid$rdif<=1e-6,]
+
+# alguns metabolitos do kegg são o closest kegg match para mais do que um pico
+# para cada metabolito kegg com match vamos escolher o melhor match (com rdif menor)
+unikegg=unique(keggid$closestkegg)
+tokeep=vector()
+for (i in 1:length(unikegg)){
+  lines=keggid[keggid$closestkegg==unikegg[i],]
+  bestmatch=min(lines$rdif,na.rm=T)
+  sellines=which(keggid$closestkegg==unikegg[i] & keggid$rdif==bestmatch)
+  tokeep[i]=sellines[1]
+}
+
+unikeggid=keggid[tokeep,]
+
+# substituir valores NA (nas intensidades dos picos) por 0
+unikeggid[is.na(unikeggid)]=0
+
+# função para calcular o personalized page rank (ou random walk with restart) às 14 amostras
+blockppr=function(g,tab, keggdata,dp){
+  pprinput=data.frame(metabolites=tab$id,T1=0,T2=0,T3=0,T4=0,T5=0,T6=0,T7=0,E1=0,E2=0,E3=0,E4=0,E5=0,E6=0,E7=0,stringsAsFactors = F)
+  for (i in 1:nrow(keggdata)){
+    pprinput[which(pprinput$metabolites==keggdata$closestkegg[i]),2:15]=keggdata[i,9:22]
+  }
+  pproutput=pprinput
+  for (i in 1:14){
+    pproutput[,i+1]=page_rank(g,vids=V(g),directed=F,damping=dp,personalized=pprinput[,i+1])$vector
+    
+  }
+  pproutput
+}
+
+# exemplo de utilização da função 
+pprout=blockppr(ghsa_main,hsa_met_tab,unikeggid,0.85)
+
+
+# para avaliar se os resultados são idênticos ao expectável ao acaso, é necessário recalcular o personalized page rank (ppr)
+# com dados aleatorizados (baralhando a identificação dos metabolitos em cada amostra)
+randppr=function(g,tab, keggdata,dp){
+  rkeggdata=keggdata
+  for (i in 1:14){
+    rkeggdata[,i+8]=keggdata[sample(nrow(keggdata)),i+8]  
+  }
+  rpprout=blockppr(g,tab, rkeggdata,dp)
+  rpprout
+}
+
+
+# função para calcular a diferença de ppr entre amostras T (THP1) e amostras E (THP1 + E coli) para cada metabolito da rede
+diffTE=function(pproutput){
+  T=rowSums(pproutput[,2:8])
+  E=rowSums(pproutput[,9:15])
+  dTE=T-E
+}
+
+# função para sumarizar os resultados das difernças de ppr entre amostras por pathway 
+met2path=function(dTE,psets){
+  pvec=vector()
+  for (i in 1:length(psets)){
+    pvec[i]=sum(dTE[psets[[i]]])
+  }
+  pvec
+}
+
+# função para sumarizar os resultados das difernças de ppr entre amostras por cluster da rede
+met2comm=function(dTE,membvec){
+  pvec=vector()
+  for (i in 1:max(membvec)){
+    pvec[i]=sum(dTE[which(membvec==i)])
+  }
+  pvec
+}
+
+
+# função global que calcula ppr com amostras observadas e com um numero de amostras aleatórias de modo a fazer uma 
+# avaliação estatística dos resultados
+pprstat=function(g,tab, keggdata,dp,nrep,psets,pfreq,membvec){
+  pprout=blockppr(g,tab,keggdata,dp)
+  dTE=diffTE(pprout)
+  pscore=met2path(dTE,psets)
+  cscore=met2comm(dTE,membvec)
+  p2score=met2path(abs(dTE),psets)
+  c2score=met2comm(abs(dTE),membvec)
+  pdTE=dTE*0
+  ppscore=pscore*0
+  pp2score=p2score*0
+  pcscore=cscore*0
+  pc2score=c2score*0
+  for (i in 1:nrep){
+    rpprout=randppr(g,tab,keggdata,dp)
+    rdTE=diffTE(rpprout)
+    rpscore=met2path(rdTE,psets)
+    rp2score=met2path(abs(rdTE),psets)
+    rcscore=met2comm(rdTE,membvec)
+    rc2score=met2comm(abs(rdTE),membvec)
+    pdTE=pdTE+(dTE>rdTE)
+    ppscore=ppscore+(pscore>rpscore)
+    pp2score=pp2score+(p2score>rp2score)
+    pcscore=pcscore+(cscore>rcscore)
+    pc2score=pc2score+(c2score>rc2score)
+  }
+  pdTE=pdTE/nrep
+  ppscore=ppscore/nrep
+  pp2score=pp2score/nrep
+  pcscore=pcscore/nrep
+  pc2score=pc2score/nrep
+  metdf=data.frame(id=tab$id, name=tab$name, diffTE=dTE, p=pdTE)
+  pathdf=data.frame(pathway=pfreq$path, score=pscore,p=ppscore, absscore=p2score, absp=pp2score)
+  commdf=data.frame(community=(1:max(membvec)),score=cscore,p=pcscore,absscore=c2score,absp=pc2score)
+  list(met=metdf,path=pathdf,comm=commdf)
+}
+
+# aplicação da função global
+statout=pprstat(ghsa_main,hsa_met_tab,unikeggid,dp=0.85,nrep=1000,hsa_path_sets, hsa_path_freq,louvmemb)
+
+# gravar resultados em ficheiros de texto
+write.csv(statout$met,file="metabolite_pprdiff.csv",row.names = F)
+write.csv(statout$path,file="pathway_pprdiff.csv",row.names = F)
+write.csv(statout$comm,file="cluster_pprdiff.csv",row.names = F)
+write.csv(p2com,file="cluster2pathway.csv",row.names = F)
+
+
+# guardar os resultados da análise por pathway num novo data frame
+pathway_pprdiff=statout$path
+
+
+# extrair as pathways com scores mais significativos
+# o threshold usado pode ser escolhido tendo em conta o número de pathways que passam o 
+# filtro de forma a que o gráfico seja mais legível
+pathtoplot1=pathway_pprdiff[pathway_pprdiff$p<0.05,]
+pathtoplot2=pathway_pprdiff[pathway_pprdiff$p>0.95,]
+
+# retirar pathways que se referem a outros organismos, outros tecidos ou tipos de células ou a doenças
+pathtoplot1_clean=pathtoplot1[c(-2,-8,-16,-17,-18,-19,-21,-22,-26,-27,-28,-29,-31,-32,-33,-34,-35,-36,-37,-40,-41,-42,-43,-44,-45,-46),]
+pathtoplot2_clean=pathtoplot2[c(-1,-3,-9,-13,-17,-18,-19,-20,-21,-23,-25,-26,-29,-30),]
+
+# juntar os dois grupos de pathways (associados a amostras T (p proximo de 1) e associados
+# a amostras E (p proximo de 0)) num data frame único
+pathtoplot=rbind(pathtoplot1_clean,pathtoplot2_clean)
+
+# acrescenta uma coluna com informação sobre o número de metabolitos de cada pathway
+pathtoplot$n_met=0
+for (i in 1:nrow(pathtoplot)){
+  pathtoplot$n_met[i]=hsa_path_freq$count[hsa_path_freq$path==pathtoplot$pathway[i]]
+}
+
+# carregar a library que permite fazer o bubble plot. Têm que instalar primeiro.
+library(ggplot2)
+
+# fazer um bubble plot em que cada bubble representa uma pathway, a posição no eixo do x 
+# representa o score (a diferença do personalized page rank entre amostras T e amostras E) 
+# a cor representa o p (proporção de vezes que o score observado foi maior do que scores 
+# aleatórios e o tamanho representa o número de metabolitos da pathway)
+
+ggplot(data=pathtoplot)+
+  geom_count(aes(x=score, y=pathway, color=p, size=n_met))+
+  scale_color_gradient(low="orange",high="blue")+
+  labs(x="diff T-E score", y="Pathways")
+
